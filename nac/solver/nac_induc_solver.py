@@ -10,6 +10,7 @@ from tensorboardX import SummaryWriter
 
 import torch
 from torch.autograd import Variable
+from torch_geometric.loader import DataLoader
 
 from nac.utils.misc import accuracy, load_state_variable, save_load_split, gen_uniform_60_20_20_split
 
@@ -186,6 +187,196 @@ class NACInductiveSolver(InductiveSolver):
         metrics['best_top1_test'] = best_prec1_test
 
         return metrics
+    
+    # Tox21 (graphs instead of nodes)
+    def updata_weight_step_tox21(self, model, data):
+        start_time = time.time()
+
+        # get_data
+        inp = data[data.train_mask] # , Variable(data.y[data.train_mask], requires_grad=False)
+
+        train_loader = DataLoader(inp, batch_size=128, shuffle=True)
+        
+        # measure data loading time
+        self.meters.data_time.update(time.time() - start_time)
+
+        logits_list = []  # List to store logits from all batches
+        target_list = []  # List to store targets from all batches
+        
+        # forward
+        for batch in train_loader:
+            logits = model(batch)
+            target = torch.tensor(batch.y, requires_grad=False).unsqueeze(-1)
+            
+            logits_list.append(logits)
+            target_list.append(target)
+            
+            # clear gradient
+            self.optimizer.zero_grad()
+
+            # compute and update gradient
+            loss = self.criterion(logits, target)
+
+            # compute and update gradient
+            loss.backward()
+
+            # # Clip Grad norm
+            torch.nn.utils.clip_grad_norm_(model.parameters(), self.config.grad_clip)
+
+            # # compute and update gradient
+            self.optimizer.step()
+        
+        
+        ################
+        # logits = model(inp)
+
+        # clear gradient
+        # self.optimizer.zero_grad()
+
+        # compute and update gradient
+        # loss = self.criterion(logits, target)
+
+
+        # Concatenate logits and targets from all batches
+        logits = torch.cat(logits_list, dim=0)
+        target = torch.cat(target_list, dim=0)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(logits, target, topk=(1, self.topk))
+
+        reduced_loss = loss.clone()
+        reduced_prec1 = prec1
+        reduced_prec5 = prec5
+
+        self.meters.losses.reduce_update(reduced_loss)
+        self.meters.top1.reduce_update(reduced_prec1)
+        self.meters.top5.reduce_update(reduced_prec5)
+
+        # # compute and update gradient
+        # loss.backward()
+
+        # # # Clip Grad norm
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), self.config.grad_clip)
+
+        # # # compute and update gradient
+        # self.optimizer.step()
+        
+
+    def _train_tox21(self, model):
+        self._pre_train(model=model)
+
+        model.eval()
+
+        iter_per_epoch = len(self.data['loader'])
+        total_step = iter_per_epoch * self.config.data.max_epoch
+        end = time.time()
+
+        best_prec1_val , best_prec1_test = 0, 0
+
+        for epoch in tqdm(range(0, self.config.data.max_epoch)):
+            start_step = epoch * iter_per_epoch
+
+            if start_step < self.state['last_iter']:
+                continue
+
+            self.lr_scheduler.step()
+            # lr_scheduler.get_lr()[0] is the main lr
+            current_lr = self.lr_scheduler.get_lr()[0]
+
+            curr_step = start_step
+            
+            
+            data = self.data['loader']
+
+            # jumping over trained steps
+            if curr_step < self.state['last_iter']:
+                continue
+
+            # architecture step: optizing alpha for one epoch
+            self.controller.step(data)
+
+            # skip weight step: optizing \omega
+            # but will updata subnet in finetuning phase
+            if getattr(self.config.nas, "updata_weight", False) or self.controller.subnet != None:
+                self.updata_weight_step_tox21(model, data)
+
+            # measure elapsed time
+            self.meters.batch_time.update(time.time() - end)
+
+            # training logger
+            if curr_step % 1 == 0:
+                self.tb_logger.add_scalar('lr', current_lr, curr_step)
+
+                if getattr(model, 'arch_parameters', False):
+                    self.tb_logger.add_histogram('na_alphas', model.na_alphas, curr_step)
+
+                remain_secs = (total_step - curr_step) * self.meters.batch_time.avg
+                remain_time = datetime.timedelta(seconds=round(remain_secs))
+                finish_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + remain_secs))
+                log_msg = f'Iter: [{curr_step}/{total_step}]\t' \
+                        f'Time {self.meters.batch_time.val:.3f} ({self.meters.batch_time.avg:.3f})\t' \
+                        f'Data {self.meters.data_time.val:.3f} ({self.meters.data_time.avg:.3f})\t' \
+                        f'Remaining Time {remain_time} ({finish_time})'
+                self.logger.info(log_msg)
+
+                # update weight logs
+                if getattr(self.config.nas, "updata_weight", False) or self.controller.subnet != None:
+                    self.tb_logger.add_scalar('loss_train', self.meters.losses.avg, curr_step)
+                    self.tb_logger.add_scalar('acc1_train', self.meters.top1.avg, curr_step)
+                    self.tb_logger.add_scalar('acc5_train', self.meters.top5.avg, curr_step)
+
+                    log_msg = f'Loss {self.meters.losses.val:.4f} ({self.meters.losses.avg:.4f})\t' \
+                            f'Prec@1 {self.meters.top1.val:.3f} ({self.meters.top1.avg:.3f})\t' \
+                            f'Prec@5 {self.meters.top5.val:.3f} ({self.meters.top5.avg:.3f})\t' \
+                            f'LR {current_lr:.6f}\t'
+                    self.logger.info(log_msg)
+
+            end = time.time()
+
+            # testing during training
+            if curr_step >= 0 and (epoch + 1) % self.config.saver.val_epoch_freq == 0:
+                metrics = self._validate(model=model)
+                loss_val = metrics['loss']
+                prec1_val = metrics['top1']
+
+                metrics = self._evaluate(model=model)
+                loss_test = metrics['loss']
+                prec1_test = metrics['top1']
+
+                # recording best accuracy performance based on validation accuracy
+                if prec1_val > best_prec1_val:
+                    best_prec1_val = prec1_val
+                    best_prec1_test = prec1_test
+
+                # testing logger
+                self.tb_logger.add_scalar('loss_val', loss_val, curr_step)
+                self.tb_logger.add_scalar('acc1_val', prec1_val, curr_step)
+                self.tb_logger.add_scalar('loss_test', loss_test, curr_step)
+                self.tb_logger.add_scalar('acc1_test', prec1_test, curr_step)
+
+                # save ckpt
+                if self.config.saver.save_many:
+                    ckpt_name = f'{self.path.save_path}/ckpt_{curr_step}.pth.tar'
+                else:
+                    ckpt_name = f'{self.path.save_path}/ckpt.pth.tar'
+
+                self.state['model'] = model.state_dict()
+                self.state['optimizer'] = self.optimizer.state_dict()
+                self.state['last_epoch'] = epoch
+                self.state['last_iter'] = curr_step
+                if getattr(model, 'arch_parameters', False):
+                    self.state['arch_parameters'] = model.arch_parameters()
+
+                torch.save(self.state, ckpt_name)
+                genotype = model.genotype()
+                self.logger.info('genotype = %s', genotype)
+
+        self.dump_subnet_to_result()
+        metrics = {}
+        metrics['best_top1_val'] = best_prec1_val
+        metrics['best_top1_test'] = best_prec1_test
+
+        return metrics
 
     def dump_subnet_to_result(self):
         res = []
@@ -198,7 +389,7 @@ class NACInductiveSolver(InductiveSolver):
         self.logger.info('searched res for {} saved in {}'.format(self.config.data.task, result_filename))
 
     def train(self):
-        self._train(model=self.model)
+        self._train_tox21(model=self.model)
 
     def evaluate(self):
         self._evaluate(model=self.model)

@@ -18,35 +18,13 @@ The originization of this repo is shown as follow:
 `-- examples # the configuration for runing experiments
 ```
 
-## Enviroment
-First, install the required enviromental setup.
-```bash
-conda create -n nac python=3.7
-conda activate nac
-
-# please change the cuda/device version as you need
-pip install -r requirements.txt
-```
-
 ## Usage
-Go to the workspace dir of examples,
+Go to the workspace dir of examples, run
 
-1. First, change the ROOT Path in scripts to the current dir of the repo:
-```bash
-ROOT=/mnt/home/pxu22/codes/NAC -> Current Path to Repo
-export PYTHONPATH=$ROOT:$PYTHONPATH
+```
+python -W ignore -u -m nac.solver.nac_induc_solver --config="./examples/Tox21/lnac/config_tox21.yaml" --phase train_search
 ```
 
-2. Run the train script first to get the searched result:
-```bash
-bash train.sh
-```
-
-3. Go to the finetune dir, and get the finetuned result of specific architecture
-```bash
-cd Finetune;
-bash finetune.sh;
-```
 
 ## Citation
 ```

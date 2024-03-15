@@ -150,11 +150,10 @@ def load_state_model(model, state):
 
     logger = get_logger(__name__)
     logger.info('======= loading model state... =======')
-
     model.load_state_dict(state, strict=False)
 
     state_keys = set(state.keys())
-    model_keys = set(model.state_dict().keys())
+    model_keys = set(model.state_dict().keys()) 
     missing_keys = model_keys - state_keys
     for k in missing_keys:
         logger.warn(f'missing key: {k}')
@@ -306,6 +305,7 @@ def param_group_all(model, config):
 
 def index_to_mask(index, size):
     mask = torch.zeros(size, dtype=torch.bool, device=index.device)
+    index = index.to(torch.long)
     mask[index] = 1
     return mask
 
@@ -324,6 +324,15 @@ def save_load_split(data, gen_splits):
     data.train_mask = index_to_mask(split[0], data.num_nodes)
     data.val_mask = index_to_mask(split[1], data.num_nodes)
     data.test_mask = index_to_mask(split[2], data.num_nodes)
+    return data
+
+
+# Tox21 specific (splitting graphs instead of nodes)
+def save_load_split_graph(data, gen_splits):
+    split = gen_splits(data)
+    data.train_mask = index_to_mask(split[0], len(data))
+    data.val_mask = index_to_mask(split[1], len(data))
+    data.test_mask = index_to_mask(split[2], len(data))
     return data
 
 ########################

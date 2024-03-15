@@ -1,5 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import global_mean_pool, global_add_pool
+
 
 from ..ops import NaOp, ScOp, LaOp
 
@@ -46,7 +48,7 @@ class NACBackBone(nn.Module):
             self.layer6 = LaOp(ops[-1], hidden_size, 'linear', num_layers)
         self.classifier = nn.Linear(hidden_size, out_dim)
 
-    def forward(self, data):
+    def forward_old(self, data):
         x, edge_index = data.x, data.edge_index
 
         x = self.lin1(x)
@@ -73,6 +75,43 @@ class NACBackBone(nn.Module):
             logits = self.classifier(x)
 
         return logits
+    
+    def forward(self, data):
+        # x, edge_index = data.x, data.edge_index
+        x , edge_index, batch_size = data.x, data.edge_index, data.batch
+        
+        # self.emb = AtomEncoder(hidden_channels=32)
+        x = self.lin1(x)
+        x = F.dropout(x, p=self.in_dropout, training=self.training)
+        js = []
+
+        for i in range(self.num_layers):
+            x = self.gnn_layers[i](x, edge_index)
+            if self.config.with_layernorm:
+                layer_norm = nn.LayerNorm(normalized_shape=x.size(), elementwise_affine=False)
+                x = layer_norm(x)
+            x = F.dropout(x, p=self.in_dropout, training=self.training)
+            if self.jk:
+                if i == self.num_layers - 1 and self.config.fix_last:
+                    js.append(x)
+                else:
+                    js.append(self.sc_layers[i](x))
+
+        if self.jk:
+            x5 = self.layer6(js)
+            
+            # Graph-level readout
+            x5 = global_mean_pool(x5, batch_size)
+            
+            x5 = F.dropout(x5, p=self.out_dropout, training=self.training)
+            logits = self.classifier(x5)
+        else:
+            x = global_mean_pool(x, batch_size)
+            logits = self.classifier(x)
+
+        return logits
 
     def genotype(self):
         return self.arch
+    
+    

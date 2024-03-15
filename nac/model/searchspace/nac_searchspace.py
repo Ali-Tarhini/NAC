@@ -8,6 +8,8 @@ from ..ops.dynamic_layers import NaMixedOp, ScMixedOp, LaMixedOp
 from ..ops.dynamic_layers import NA_PRIMITIVES, SC_PRIMITIVES, LA_PRIMITIVES
 from ..backbone.nac_backbone import NACBackBone
 
+from torch_geometric.nn import global_mean_pool, global_add_pool
+
 class NACSearchSpace(nn.Module):
     '''
         implement this for sane.
@@ -80,13 +82,16 @@ class NACSearchSpace(nn.Module):
                 #     m.bias.data.zero_()
 
     def forward(self, data, discrete=False):
-        x, edge_index = data.x, data.edge_index
-
+        # x, edge_index = data.x, data.edge_index
+        # tox21
+        x , edge_index, batch_size = data.x, data.edge_index, data.batch
+        
         self.na_weights = F.normalize(self.na_alphas, p=2, dim=-1)
         self.sc_weights = F.normalize(self.sc_alphas, p=2, dim=-1)
         self.la_weights = F.normalize(self.la_alphas, p=2, dim=-1)
 
         # generate weights by softmax
+        x = x.to(torch.float32)
         x = self.lin1(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x1 = self.layer1(x, self.na_weights[0], edge_index)
@@ -102,6 +107,9 @@ class NACSearchSpace(nn.Module):
             x4 = (x3, self.layer4(x1, self.sc_weights[0]), self.layer5(x2, self.sc_weights[1]))
 
         x5 = self.layer7(x4, self.la_weights[0])
+        
+        # batch_size is an array 
+        x5 = global_mean_pool(x5, batch_size) # tox21 graphs
         x5 = F.dropout(x5, p=self.dropout, training=self.training)
 
         logits = self.classifier(x5)

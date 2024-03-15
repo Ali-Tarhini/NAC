@@ -10,12 +10,19 @@ from tensorboardX import SummaryWriter
 
 import torch
 from torch.autograd import Variable
+import torch.nn.functional as F
 
-from torch_geometric.datasets import Planetoid, Amazon, Coauthor, CoraFull, Reddit, PPI
+from torch_geometric.datasets import Planetoid, Amazon, Coauthor, CoraFull, Reddit, PPI, MoleculeNet
 from torch_geometric.utils import add_self_loops
+from torch_geometric.loader import DataLoader
+import numpy as np
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+import torch.nn.functional as F
 
 from nac.utils.misc import makedir, create_logger, get_logger, AverageMeter, accuracy, load_state_model, load_state_optimizer,\
-                         parse_config, set_seed, param_group_all, modify_state, save_load_split, gen_uniform_60_20_20_split, load_state_variable, gen_uniform_80_80_20_split
+                         parse_config, set_seed, param_group_all, modify_state, save_load_split, gen_uniform_60_20_20_split, load_state_variable, gen_uniform_80_80_20_split,\
+                         save_load_split_graph
 from nac.model import model_entry
 from nac.optimizer import optim_entry
 from nac.lr_scheduler import scheduler_entry
@@ -76,7 +83,6 @@ class InductiveSolver(BaseSolver):
 
     def build_model(self):
         self.model = model_entry(self.config.model)
-
         if 'model' in self.state:
             load_state_model(self.model, self.state['model'])
         else:
@@ -134,15 +140,45 @@ class InductiveSolver(BaseSolver):
             dataset = Planetoid(self.config.data.root, 'Cora')
         elif self.config.data.task == 'CiteSeer':
             dataset = Planetoid(self.config.data.root, 'CiteSeer')
+        # Tox21 dataset
+        elif self.config.data.task == 'Tox21':
+            dataset = MoleculeNet(self.config.data.root, 'Tox21')
         else:
             raise NotImplementedError(f'Dataset {self.config.data.task} is not supported!')
 
-        data = dataset[0]
-        data = save_load_split(data, gen_uniform_80_80_20_split)
-        edge_index, _ = add_self_loops(data.edge_index, num_nodes=data.x.size(0))
-        data.edge_index = edge_index
 
-        self.data = {'loader': data}
+        if self.config.data.task == 'Tox21':
+            # dataset = MoleculeNet(self.config.data.root, 'Tox21')
+
+            # the dataset has a lot of nans. Select only one toxicity test (from the 12) in order to remove the nans. 
+            test_nb = 7 # from 12 toxicity tests
+            test_labels = dataset.y.T[test_nb]
+            # only keep the selected label values in the data set (y=[1,12] => y=[1])
+            dataset.data.y = test_labels
+            
+            # Create a boolean mask indicating NaN values
+            notnan_mask = ~torch.isnan(test_labels)
+            # Get indices of NaN values
+            notnan_indices = torch.nonzero(notnan_mask).flatten()
+            # remove the samples with y=nan
+            dataset = dataset[notnan_indices]
+            
+            data = dataset
+            data = save_load_split_graph(data, gen_uniform_80_80_20_split)
+            
+            edge_index, _ = add_self_loops(data.data.edge_index, num_nodes=dataset.data.num_nodes) # not sure if I should keep it with the tox21 dataset, data.x.size(0)
+
+            data.data.edge_index = edge_index
+
+            self.data = {'loader': data}
+            
+        else:
+            data = dataset[0]
+            data = save_load_split(data, gen_uniform_80_80_20_split)
+            edge_index, _ = add_self_loops(data.edge_index, num_nodes=data.x.size(0))
+            data.edge_index = edge_index
+
+            self.data = {'loader': data}
 
     def _pre_train(self, model):
         self.meters = EasyDict()
@@ -157,7 +193,7 @@ class InductiveSolver(BaseSolver):
 
         self.num_classes = self.config.model.kwargs.get('out_dim', 1000)
         self.topk = 5 if self.num_classes >= 5 else self.num_classes
-        self.criterion = torch.nn.CrossEntropyLoss()
+        self.criterion = torch.nn.BCEWithLogitsLoss() #BCELoss() #torch.nn.CrossEntropyLoss()
 
         self.mixup = self.config.get('mixup', 1.0)
         if self.mixup < 1.0:
@@ -265,31 +301,52 @@ class InductiveSolver(BaseSolver):
         topk = 5 if num_classes >= 5 else num_classes
 
         model.eval()
-        criterion = torch.nn.CrossEntropyLoss()
+        criterion = torch.nn.BCEWithLogitsLoss() #CrossEntropyLoss()
         val_iter = len(self.data['loader'])
         end = time.time()
 
         data = self.data['loader']
 
         # get_data
-        inp, target = data, Variable(data.y[data.test_mask])
+        # inp, target = data, Variable(data.y[data.test_mask])
 
-        logits = model(inp)
+        # logits = model(inp)
+        
 
         # measure f1_score/accuracy and record loss
-        loss = criterion(logits[data.test_mask], target)
-        prec1, prec5 = accuracy(logits[data.test_mask], target, topk=(1, topk))
+        # loss = criterion(logits[data.test_mask], target)
+        
+        # tox21
+        logits_list = []  # List to store logits from all batches
+        target_list = []  # List to store targets from all batches
+        
+        inp = data[data.test_mask]
+        train_loader = DataLoader(inp, batch_size=128, shuffle=True)
+        for batch in train_loader:
+            logits = self.model(batch)
+            target = torch.tensor(batch.y, requires_grad=False).unsqueeze(-1)
+            loss = criterion(logits, target)
+            
+            logits_list.append(logits)
+            target_list.append(target)
 
-        num = inp.size(0)
-        losses.update(loss.item(), num)
-        top1.update(prec1.item(), num)
-        top5.update(prec5.item(), num)
 
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
         self.logger.info(f'Test: [{val_iter}/{val_iter}]\tTime {batch_time.val:.3f} ({batch_time.avg:.3f})')
+        
+        # Concatenate logits and targets from all batches
+        logits_list = torch.cat(logits_list, dim=0)
+        target_list = torch.cat(target_list, dim=0)        
+                    
+        prec1, prec5 = accuracy(logits_list, target_list, topk=(1, topk)) # logits[data.test_mask]
 
+        num = inp.x.size(0)
+        losses.update(loss.item(), num)
+        top1.update(prec1.item(), num)
+        top5.update(prec5.item(), num)
+        
         # gather final results
         total_num = torch.Tensor([losses.count])
         loss_sum = torch.Tensor([losses.avg*losses.count])
@@ -299,7 +356,8 @@ class InductiveSolver(BaseSolver):
         final_loss = loss_sum.item()/total_num.item()
         final_top1 = top1_sum.item()/total_num.item()
         final_top5 = top5_sum.item()/total_num.item()
-
+        
+        
         self.logger.info(f' * Prec@1 {final_top1:.3f}\t * Prec@5 {final_top5:.3f}\t\
             Loss {final_loss:.3f}\ttotal_num={total_num.item()}')
 
@@ -321,31 +379,50 @@ class InductiveSolver(BaseSolver):
         topk = 5 if num_classes >= 5 else num_classes
 
         model.eval()
-        criterion = torch.nn.CrossEntropyLoss()
+        criterion = torch.nn.BCEWithLogitsLoss() #CrossEntropyLoss() # tox21
         val_iter = len(self.data['loader'])
         end = time.time()
 
         data = self.data['loader']
 
         # get_data
-        inp, target = data, Variable(data.y[data.val_mask])
+        # inp, target = data, Variable(data.y[data.val_mask])
 
-        logits = model(inp)
-
+        # logits = model(inp)
+        logits_list = []  # List to store logits from all batches
+        target_list = []  # List to store targets from all batches
+        
+        inp = data[data.val_mask]
+        train_loader = DataLoader(inp, batch_size=128, shuffle=True)
+        for batch in train_loader:
+            logits = self.model(batch)
+            target = torch.tensor(batch.y, requires_grad=False).unsqueeze(-1)
+            loss = criterion(logits, target)
+            
+            logits_list.append(logits)
+            target_list.append(target)
+            
         # measure f1_score/accuracy and record loss
-        loss = criterion(logits[data.val_mask], target)
-        prec1, prec5 = accuracy(logits[data.val_mask], target, topk=(1, topk))
-
-        num = inp.size(0)
-        losses.update(loss.item(), num)
-        top1.update(prec1.item(), num)
-        top5.update(prec5.item(), num)
+        # loss = criterion(logits[data.val_mask], target)
 
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
         self.logger.info(f'Val: [{val_iter}/{val_iter}]\tTime {batch_time.val:.3f} ({batch_time.avg:.3f})')
+        
+        
+        # Concatenate logits and targets from all batches
+        logits_list = torch.cat(logits_list, dim=0)
+        target_list = torch.cat(target_list, dim=0)
+        
+        prec1, prec5 = accuracy(logits_list, target_list, topk=(1, topk))
 
+        # num = inp.size(0)
+        num = inp.x.size(0)
+        losses.update(loss.item(), num)
+        top1.update(prec1.item(), num)
+        top5.update(prec5.item(), num)
+        
         # gather final results
         total_num = torch.Tensor([losses.count])
         loss_sum = torch.Tensor([losses.avg*losses.count])
